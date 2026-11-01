@@ -74,6 +74,15 @@ def to_date(d):
     return d.date() if hasattr(d, 'date') else d
 
 
+def gosh_fy_bounds(start_d, end_d=None):
+    """Financial GOSH year (1 April to 31 March) for the period [start_d, end_d]."""
+    s = to_date(start_d)
+    e = to_date(end_d) if end_d is not None else s
+    mid = s + (e - s) // 2
+    y = mid.year if mid.month >= 4 else mid.year - 1
+    return datetime(y, 4, 1).date(), datetime(y + 1, 3, 31).date()
+
+
 def safe_ini(val):
     if val is None:
         return ""
@@ -328,7 +337,7 @@ def _detect_rota_cols(df, a_name, b_name):
 def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e, a_name="Consultant A", b_name="Consultant B"):
     """Reads 'Previous Period Rota' + 'Rota' (Rota wins on overlapping dates) to build cumulative memory."""
     mem = empty_memory()
-    counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0, "BH_days": 0, "BH_groups": set(), "AL_days": 0, "SL_days": 0})
+    counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0, "BH_days": 0, "BH_groups": set()})
     sel_s, ytd_s, ytd_e = to_date(sel_s), to_date(ytd_s), to_date(ytd_e)
 
     active_initials = [safe_ini(c.get('Initials')) for c in consultants if c.get('Active', True) and safe_ini(c.get('Initials'))]
@@ -393,10 +402,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e, a_name=
                             if ini and served(ini, r_date):
                                 counts[ini]["BH_days"] += 1
                                 if bh_grp: counts[ini]["BH_groups"].add(bh_grp)
-                    for l_ini, l_mark in rec["leave"].items():  # AL / SL days requested before this period
-                        l_mark = safe_ini(l_mark)
-                        if l_mark in ("AL", "SL") and served(l_ini, r_date):
-                            counts[l_ini][l_mark + "_days"] += 1
                 if a_ini:
                     mem["cycle_a"][r_date] = a_ini
                     mem["last_a_dates"][a_ini] = max(mem["last_a_dates"].get(a_ini, datetime.min.date()), r_date)
@@ -947,15 +952,16 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         rota_data.append(row)
         curr_d += timedelta(days=1)
 
-    # AL / SL days requested, read from the Rota rows exactly as the Excel formulas will count them
-    leave_ct = {i: {"AL_p": 0, "SL_p": 0, "AL_y": 0, "SL_y": 0} for i in active_initials}
+    # AL / SL days requested in the Period and in the Financial GOSH Year (1 Apr to 31 Mar)
+    fy_s, fy_e = gosh_fy_bounds(curr_d_start, fin_d)
+    leave_ct = {i: {"AL_p": 0, "SL_p": 0, "AL_fy": 0, "SL_fy": 0} for i in active_initials}
     for r_row in rota_data:
         r_d = datetime.strptime(r_row["Date"], "%d/%m/%Y").date()
         for i in active_initials:
             mk = r_row.get(i)
             if mk in ("AL", "SL"):
                 if curr_d_start <= r_d <= fin_d: leave_ct[i][mk + "_p"] += 1
-                if ytd_s_d <= r_d <= ytd_e_d: leave_ct[i][mk + "_y"] += 1
+                if fy_s <= r_d <= fy_e: leave_ct[i][mk + "_fy"] += 1
 
     state = {"A_MASTER_SEQ": ",".join(master_a_seq), "B_QUEUE": ",".join(active_initials),
              "CURRENT_A": final_cur_a or "", "CURRENT_B": final_cur_b or ""}
@@ -965,8 +971,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
              "YTD A": counts[k]["A_days"], "YTD B": counts[k]["B_days"], "YTD Nights": counts[k]["Nights"],
              "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"], "YTD BH": counts[k]["BH_days"],
              "Period AL (days)": leave_ct[k]["AL_p"], "Period SL (days)": leave_ct[k]["SL_p"],
-             "YTD AL (days)": hist_counts.get(k, {}).get("AL_days", 0) + leave_ct[k]["AL_y"],
-             "YTD SL (days)": hist_counts.get(k, {}).get("SL_days", 0) + leave_ct[k]["SL_y"]} for k in active_initials]
+             "GOSH Year AL (days)": leave_ct[k]["AL_fy"], "GOSH Year SL (days)": leave_ct[k]["SL_fy"]} for k in active_initials]
     return pd.DataFrame(rota_data), pd.DataFrame(summ), state
 
 
@@ -1034,19 +1039,35 @@ def run_rota_v2(leave_df, staff_df, shifts_df, sel_s, sel_e, ytd_s, ytd_e, locum
     name_lookup = {safe_ini(c["Initials"]): c.get("Full Name", "") for c in consultants}
     summ.insert(1, "Full Name", summ["Initials"].map(name_lookup))
 
-    # Worked BEFORE this period (within the YTD window): fixed starting point for the live Excel formulas
+    # Add AL / SL days from Previous Period Rota that fall inside the Financial GOSH Year (1 Apr to 31 Mar)
+    fy_s, fy_e = gosh_fy_bounds(sel_s, sel_e)
+    prev_df = mem["prev_rota_df"]
+    if prev_df is not None and not prev_df.empty and "Date" in prev_df.columns:
+        prev_al = {i: 0 for i in summ["Initials"]}
+        prev_sl = {i: 0 for i in summ["Initials"]}
+        for _, prow in prev_df.iterrows():
+            pd_d = parse_any_date(prow.get("Date"))
+            if pd_d and fy_s <= pd_d <= fy_e:
+                for ini in prev_al:
+                    mk = safe_ini(prow.get(ini))
+                    if mk == "AL": prev_al[ini] += 1
+                    elif mk == "SL": prev_sl[ini] += 1
+        summ["GOSH Year AL (days)"] = summ["GOSH Year AL (days)"] + summ["Initials"].map(prev_al)
+        summ["GOSH Year SL (days)"] = summ["GOSH Year SL (days)"] + summ["Initials"].map(prev_sl)
+
+    # Worked BEFORE this period (within the YTD window): fixed starting point for the live Excel shift formulas
     prior = mem["counts"]
     summ[f"Prior YTD {a_name}"] = summ["Initials"].map(lambda i: prior.get(i, {}).get("A_days", 0))
     summ[f"Prior YTD {b_name}"] = summ["Initials"].map(lambda i: prior.get(i, {}).get("B_days", 0))
     summ["Prior YTD Nights"] = summ["Initials"].map(lambda i: prior.get(i, {}).get("Nights", 0))
     summ["Prior YTD BH"] = summ["Initials"].map(lambda i: prior.get(i, {}).get("BH_days", 0))
-    summ["Prior YTD AL"] = summ["Initials"].map(lambda i: prior.get(i, {}).get("AL_days", 0))
-    summ["Prior YTD SL"] = summ["Initials"].map(lambda i: prior.get(i, {}).get("SL_days", 0))
 
     state["PERIOD_START"] = to_date(sel_s).strftime("%d/%m/%Y")
     state["PERIOD_END"] = to_date(sel_e).strftime("%d/%m/%Y")
     state["YTD_START"] = to_date(ytd_s).strftime("%d/%m/%Y")
     state["YTD_END"] = to_date(ytd_e).strftime("%d/%m/%Y")
+    state["GOSH_FY_START"] = fy_s.strftime("%d/%m/%Y")
+    state["GOSH_FY_END"] = fy_e.strftime("%d/%m/%Y")
     state["ENGINE_A_SHIFT"], state["ENGINE_B_SHIFT"] = a_name, b_name
 
     if extras:
@@ -1070,21 +1091,23 @@ def _with_real_dates(df):
     return out
 
 
-def _write_live_summary(ws, summary_df, rota_df, state_dict):
+def _write_live_summary(ws, summary_df, rota_df, state_dict, prev_rota_df=None):
     """Overwrite the Summary sheet's count cells with formulas that read the Rota sheet, so manual edits
     to the rota (e.g. swapping people) update the fairness table instantly."""
     a_name, b_name = state_dict.get("ENGINE_A_SHIFT"), state_dict.get("ENGINE_B_SHIFT")
     ca, cb, cn = _col(rota_df, a_name), _col(rota_df, b_name), _col(rota_df, "Nights")
     ps, pe = parse_any_date(state_dict.get("PERIOD_START")), parse_any_date(state_dict.get("PERIOD_END"))
     ys, ye = parse_any_date(state_dict.get("YTD_START")), parse_any_date(state_dict.get("YTD_END"))
-    if not all([ca, cb, cn, ps, pe, ys, ye]):
+    fs = parse_any_date(state_dict.get("GOSH_FY_START")) or gosh_fy_bounds(ps, pe)[0]
+    fe = parse_any_date(state_dict.get("GOSH_FY_END")) or gosh_fy_bounds(ps, pe)[1]
+    if not all([ca, cb, cn, ps, pe, ys, ye, fs, fe]):
         return False
 
     sc = {c: get_column_letter(i + 1) for i, c in enumerate(summary_df.columns)}
     needed = [f"Period {a_name}", f"Period {b_name}", "Period Nights", f"Period Total ({a_name}+Nights)",
               f"YTD {a_name}", f"YTD {b_name}", "YTD Nights", f"YTD Total ({a_name}+Nights)", "YTD BH",
               f"Prior YTD {a_name}", f"Prior YTD {b_name}", "Prior YTD Nights", "Prior YTD BH",
-              "Period AL (days)", "Period SL (days)", "YTD AL (days)", "YTD SL (days)", "Prior YTD AL", "Prior YTD SL", "Full Name"]
+              "Period AL (days)", "Period SL (days)", "GOSH Year AL (days)", "GOSH Year SL (days)", "Full Name"]
     if any(n not in sc for n in needed):
         return False
 
@@ -1092,16 +1115,20 @@ def _write_live_summary(ws, summary_df, rota_df, state_dict):
     last = len(rota_df) + 1
     rng = lambda col: f"Rota!${col}$2:${col}${last}"
     dr = rng("A")
+    has_prev = prev_rota_df is not None and not prev_rota_df.empty
+    plast = (len(prev_rota_df) + 1) if has_prev else 0
+    prng = lambda col: f"'Previous Period Rota'!${col}$2:${col}${plast}"
 
     # Editable date parameters, to the right of the table
     lab_c, val_c = len(summary_df.columns) + 2, len(summary_df.columns) + 3
     vl = get_column_letter(val_c)
-    for r, (label, val) in enumerate([("Period start", ps), ("Period end", pe), ("YTD start", ys), ("YTD end", ye)], start=1):
+    for r, (label, val) in enumerate([("Period start", ps), ("Period end", pe), ("YTD start", ys), ("YTD end", ye),
+                                      ("GOSH Year start", fs), ("GOSH Year end", fe)], start=1):
         ws.cell(row=r, column=lab_c, value=label)
         cell = ws.cell(row=r, column=val_c, value=val)
         cell.number_format = "DD/MM/YYYY"
-    ws.cell(row=6, column=lab_c, value="Counts are live formulas on the Rota sheet. Edit names there (or the dates above) and this table updates.")
-    ws.cell(row=7, column=lab_c, value="'Prior YTD' = shifts worked before this period (from the uploaded history).")
+    ws.cell(row=8, column=lab_c, value="Counts are live formulas on the Rota sheet. Edit names there (or the dates above) and this table updates.")
+    ws.cell(row=9, column=lab_c, value="'Prior YTD' = shifts worked before this period (from the uploaded history).")
 
     def cnt(col, r, lo, hi):
         return f'COUNTIFS({rng(col)},$B{r},{dr},">="&${vl}${lo},{dr},"<="&${vl}${hi})'
@@ -1142,12 +1169,17 @@ def _write_live_summary(ws, summary_df, rota_df, state_dict):
         else:
             ws[f"{sc['YTD BH']}{r}"] = f"={sc['Prior YTD BH']}{r}"
 
-        l_col = _col(rota_df, summary_df.iloc[r - 2]["Initials"])  # this person's leave-marker column on the Rota sheet
+        ini = summary_df.iloc[r - 2]["Initials"]
+        l_col = _col(rota_df, ini)  # this person's leave-marker column on the Rota sheet
+        p_col = _col(prev_rota_df, ini) if has_prev else None
         if l_col:
             for kind in ("AL", "SL"):
                 lr = rng(l_col)
                 ws[f"{sc[f'Period {kind} (days)']}{r}"] = f'=COUNTIFS({lr},"{kind}",{dr},">="&${vl}$1,{dr},"<="&${vl}$2)'
-                ws[f"{sc[f'YTD {kind} (days)']}{r}"] = f'={sc[f"Prior YTD {kind}"]}{r}+COUNTIFS({lr},"{kind}",{dr},">="&${vl}$3,{dr},"<="&${vl}$4)'
+                fy_formula = f'COUNTIFS({lr},"{kind}",{dr},">="&${vl}$5,{dr},"<="&${vl}$6)'
+                if p_col:
+                    fy_formula += f'+COUNTIFS({prng(p_col)},"{kind}",{prng("A")},">="&${vl}$5,{prng("A")},"<="&${vl}$6)'
+                ws[f"{sc[f'GOSH Year {kind} (days)']}{r}"] = f"={fy_formula}"
 
     tot = n_rows + 2
     ws[f"A{tot}"] = "TOTAL"
@@ -1184,7 +1216,7 @@ def export_master_excel(config_shifts, config_staff, rota_df, summary_df, state_
             hist_out = history_from_staff(config_staff, config_shifts)
         hist_out.to_excel(writer, index=False, sheet_name="Config_FTE_History")
 
-        live = _write_live_summary(writer.sheets["Summary"], summary_df, rota_x, state_dict)
+        live = _write_live_summary(writer.sheets["Summary"], summary_df, rota_x, state_dict, prev_x)
         writer.book.calculation.fullCalcOnLoad = True  # make Excel compute the formulas on open
 
         align_left = Alignment(horizontal="left", vertical="center")
@@ -1202,7 +1234,7 @@ def export_master_excel(config_shifts, config_staff, rota_df, summary_df, state_
             for i, col_cells in enumerate(ws.columns, 1):
                 head = ws.cell(row=1, column=i).value
                 vals = [len(str(cell.value)) if not (isinstance(cell.value, str) and cell.value.startswith("=")) else 8
-                        for cell in col_cells if cell.value is not None and not (s_name == "Summary" and cell.row in (6, 7))]
+                        for cell in col_cells if cell.value is not None and not (s_name == "Summary" and cell.row in (8, 9))]
                 ws.column_dimensions[get_column_letter(i)].width = min(60, max(vals + [len(str(head)) if head else 5]) + 2)
                 for cell in col_cells:
                     cell.alignment = align_left
